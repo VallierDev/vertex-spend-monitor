@@ -28,6 +28,63 @@
 4. 在运行主机安装 Python 3.10+ 和 gcloud，使用本人或组织指定的查询身份登录。
 5. 将 settings.example.json 复制为 settings.local.json，替换查询项目、真实导出表、数据集位置和时区。
 
+## 获取查询凭据
+
+先安装 [Google Cloud CLI](https://docs.cloud.google.com/sdk/docs/install)。登录账号需要拥有上面的 BigQuery 数据读取和查询权限。以下两种登录方式任选一种，设置文件的 auth 字段须与所选方式对应。
+
+### 使用 gcloud 用户登录
+
+运行以下命令，在浏览器中选择有查询权限的 Google 账号并完成授权。
+
+```sh
+gcloud auth login
+gcloud auth list
+```
+
+在 settings.local.json 中设置 "auth": "user"。脚本每次执行时向 gcloud 获取短期 access token，再调用 BigQuery。
+
+### 使用 Application Default Credentials（ADC）
+
+运行以下命令并完成浏览器授权。在授权页面允许访问 Google Cloud 的权限。
+
+```sh
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform,openid,https://www.googleapis.com/auth/userinfo.email
+```
+
+在 settings.local.json 中设置 "auth": "adc"。gcloud 会将 ADC 保存在本机配置目录，脚本通过 gcloud 换取短期 access token。若组织要求设置配额项目，可按其权限配置执行以下命令，替换项目占位值。
+
+```sh
+gcloud auth application-default set-quota-project YOUR_QUERY_PROJECT
+```
+
+命令运行主机没有可用浏览器时，可在登录命令后加 --no-launch-browser，按终端给出的链接完成登录，再在终端回填授权码。授权链接和授权码仅用于本次登录。
+
+ADC 包含可换取 access token 的 refresh token，按私密文件管理。gcloud 用户登录和 ADC 分别保存身份，切换 gcloud 用户后应核对所选认证方式的身份。具体行为见 [Google 官方 ADC 设置说明](https://docs.cloud.google.com/docs/authentication/set-up-adc-local-dev-environment)。
+
+### 使用独立认证目录
+
+可以把认证资料放在仓库外的独立目录。以下示例使用 ADC。
+
+```sh
+export CLOUDSDK_CONFIG="$HOME/.config/cloud-billing-monitor"
+mkdir -p "$CLOUDSDK_CONFIG"
+chmod 700 "$CLOUDSDK_CONFIG"
+gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform,openid,https://www.googleapis.com/auth/userinfo.email
+```
+
+在本地设置文件中加入 "gcloud_config_dir": "~/.config/cloud-billing-monitor"，并设置 "auth": "adc"。定时任务也会使用这个目录里的认证配置。
+
+结束使用时，可以在相同 CLOUDSDK_CONFIG 环境下撤销所选认证。
+
+```sh
+# 撤销 ADC
+gcloud auth application-default revoke
+# 撤销 gcloud 用户登录
+gcloud auth revoke
+```
+
+OAuth 凭据、refresh token、access token、授权码、服务账号密钥和本地认证目录均应保存在使用者自己的环境中。公开仓库只提供虚构配置示例。
+
 脚本使用 Python 标准库。auth=user 使用 gcloud auth print-access-token，auth=adc 使用 gcloud auth application-default print-access-token。gcloud 配置、OAuth 文件和本地设置由使用者自行保管。
 
 需要使用独立登录目录时，在本地设置中加入 gcloud_config_dir，填写对应的 gcloud 配置目录。脚本仅对子进程设置 CLOUDSDK_CONFIG，查询身份按该目录中的登录配置选择。
