@@ -1,0 +1,8 @@
+{
+  "query_project": "example-query-project",
+  "billing_table": "example-billing-project.billing_export.gcp_billing_export_v1_000000_000000_000000",
+  "location": "US",
+  "timezone": "Asia/Taipei",
+  "maximum_bytes_billed": 1000000000,
+  "auth": "user"
+}

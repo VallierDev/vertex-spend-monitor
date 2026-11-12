@@ -1,122 +1,208 @@
 #!/usr/bin/env python3
-"""Report daily estimates from a Vertex runner's local spend ledger."""
+"""Query official Google Cloud Billing exports in BigQuery."""
 
 import argparse
-import json
-import math
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
+import json
 from pathlib import Path
-import shlex
+import re
 import subprocess
 import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
-def amount(mapping, key):
-    value = mapping.get(key)
-    if value is None:
-        return None
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-        raise ValueError("invalid amount in Vertex ledger")
-    return value
+API = "https://bigquery.googleapis.com/bigquery/v2"
+MONEY = ("cost", "credits", "promotional_credits", "net")
 
 
-def read_report(root, day):
-    config = {}
-    for line in (root / "vertex.env").read_text().splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.strip().startswith(("VERTEX_PROJECT", "VERTEX_TOTAL_BUDGET_USD")):
-            config[key.strip()] = value.strip()
-    ledger = json.loads((root / "runners/state/vertex-spend.json").read_text())
-    accounts = ledger["accounts"]
-    rows = []
-    configured = set()
-    for slot in range(1, 10):
-        suffix = "" if slot == 1 else f"_{slot}"
-        project = config.get("VERTEX_PROJECT" + suffix)
-        if not project:
-            continue
-        configured.add(project)
-        entry = accounts.get(project, {})
-        daily = amount(entry.get("days", {}), day)
-        used = amount(entry, "total_usd")
-        limit = float(config.get("VERTEX_TOTAL_BUDGET_USD" + suffix, 0) or 0)
-        if not math.isfinite(limit) or limit < 0:
-            raise ValueError("invalid total limit in Vertex configuration")
-        remaining = round(max(0, limit - (used or 0)), 6) if limit else None
-        rows.append({
-            "slot": slot, "day_usd": daily, "used_usd": used,
-            "limit_usd": limit or None, "remaining_usd": remaining,
-        })
-    if not rows:
-        raise ValueError("no configured Vertex accounts")
+def read_settings(path):
+    settings = json.loads(path.read_text())
+    project = settings["query_project"]
+    table = settings["billing_table"]
+    if not re.fullmatch(r"[a-z][a-z0-9-]{4,61}[a-z0-9]", project):
+        raise ValueError("invalid query_project")
+    if not re.fullmatch(r"[a-z][a-z0-9-]*\.[A-Za-z0-9_]+\.[A-Za-z0-9_-]+", table):
+        raise ValueError("invalid billing_table")
+    ZoneInfo(settings.get("timezone", "Asia/Taipei"))
+    limit = settings.get("maximum_bytes_billed", 1_000_000_000)
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("maximum_bytes_billed must be a positive integer")
+    if settings.get("auth", "user") not in ("user", "adc"):
+        raise ValueError("auth must be user or adc")
+    return settings
+
+
+def access_token(settings):
+    command = ["gcloud", "auth"]
+    if settings.get("auth") == "adc":
+        command.append("application-default")
+    command.append("print-access-token")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    if result.returncode or not result.stdout.strip():
+        raise RuntimeError("gcloud authentication failed; verify the selected local identity")
+    return result.stdout.strip()
+
+
+def request(token, path, body=None):
+    data = None if body is None else json.dumps(body).encode()
+    req = Request(API + path, data=data, headers={
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+    })
+    try:
+        with urlopen(req, timeout=30) as response:
+            return json.load(response)
+    except HTTPError as error:
+        # Keep returned messages and authentication headers out of reports.
+        raise RuntimeError(f"BigQuery HTTP {error.code}; check export, IAM and query limits") from None
+
+
+def query_body(settings, day, dry_run=False):
+    table = settings["billing_table"]
+    # Sum credits within each record before grouping, preserving each cost once.
+    query = f"""
+SELECT
+  CAST(DATE(usage_start_time, @timezone) AS STRING) AS day,
+  currency,
+  COALESCE(project.id, '(billing-account)') AS project,
+  service.description AS service,
+  CAST(SUM(CAST(cost AS NUMERIC)) AS STRING) AS cost,
+  CAST(SUM(IFNULL((SELECT SUM(CAST(c.amount AS NUMERIC))
+    FROM UNNEST(credits) c), 0)) AS STRING) AS credits,
+  CAST(SUM(IFNULL((SELECT SUM(CAST(c.amount AS NUMERIC))
+    FROM UNNEST(credits) c WHERE c.type = 'PROMOTION'), 0)) AS STRING) AS promotional_credits,
+  CAST(MAX(export_time) AS STRING) AS latest_export_time
+FROM `{table}`
+WHERE usage_start_time >= TIMESTAMP(@start, @timezone)
+  AND usage_start_time < TIMESTAMP(@end, @timezone)
+GROUP BY day, currency, project, service
+ORDER BY day, currency, project, service
+"""
+    values = [
+        ("start", "DATE", day.replace(day=1).isoformat()),
+        ("end", "DATE", (day + timedelta(days=1)).isoformat()),
+        ("timezone", "STRING", settings.get("timezone", "Asia/Taipei")),
+    ]
+    body = {
+        "query": query, "useLegacySql": False, "timeoutMs": 10000,
+        "maximumBytesBilled": str(settings.get("maximum_bytes_billed", 1_000_000_000)),
+        "parameterMode": "NAMED",
+        "queryParameters": [
+            {"name": name, "parameterType": {"type": kind}, "parameterValue": {"value": value}}
+            for name, kind, value in values
+        ],
+    }
+    if settings.get("location"):
+        body["location"] = settings["location"]
+    if dry_run:
+        body["dryRun"] = True
+    return body
+
+
+def run_query(settings, day, token, dry_run=False):
+    project = quote(settings["query_project"], safe="")
+    response = request(token, f"/projects/{project}/queries", query_body(settings, day, dry_run))
+    if dry_run:
+        if response.get("errors"):
+            raise RuntimeError("BigQuery dry run returned errors")
+        return {"dry_run": True, "bytes_processed": response.get("totalBytesProcessed")}
+    reference = response.get("jobReference", {})
+    job = reference.get("jobId")
+    location = reference.get("location", settings.get("location"))
+    endpoint = f"/projects/{project}/queries/{quote(job, safe='')}" if job else None
+    deadline = time.monotonic() + 90
+    pages, schema = [], None
+    while True:
+        if response.get("errors"):
+            raise RuntimeError("BigQuery job returned errors; inspect it with local credentials")
+        if response.get("jobComplete"):
+            schema = response.get("schema", schema)
+            pages.extend(response.get("rows", []))
+            page = response.get("pageToken")
+            if not page:
+                break
+            params = {"pageToken": page, "maxResults": 10000}
+        else:
+            params = {"timeoutMs": 10000, "maxResults": 10000}
+        if not endpoint or time.monotonic() >= deadline:
+            raise RuntimeError("BigQuery query incomplete; official spend is unknown")
+        if location:
+            params["location"] = location
+        response = request(token, endpoint + "?" + urlencode(params))
+    fields = [field["name"] for field in (schema or {}).get("fields", [])]
+    return [dict(zip(fields, [cell["v"] for cell in row["f"]])) for row in pages]
+
+
+def totals(rows):
+    result = {}
+    for row in rows:
+        currency = row["currency"]
+        sums = result.setdefault(currency, {name: Decimal(0) for name in MONEY})
+        for name in MONEY[:3]:
+            sums[name] += Decimal(row[name])
+        sums["net"] = sums["cost"] + sums["credits"]
+    return {currency: {key: str(value) for key, value in values.items()}
+            for currency, values in result.items()}
+
+
+def report(rows, settings, day):
+    daily = [row for row in rows if row["day"] == day.isoformat()]
     return {
-        "date": day,
-        "daily_usd": amount(ledger["days"], day),
-        "other_configs_usd": round(sum(
-            amount(entry.get("days", {}), day) or 0
-            for project, entry in accounts.items() if project not in configured
-        ), 6),
-        "configs": rows,
+        "source": "Google Cloud Billing BigQuery export",
+        "date": day.isoformat(),
+        "timezone": settings.get("timezone", "Asia/Taipei"),
+        "month_through_date": totals(rows),
+        "daily": totals(daily),
+        "daily_status": "recorded" if daily else "no_exported_records",
+        "latest_export_time_in_period": max(
+            (row["latest_export_time"] for row in rows if row.get("latest_export_time")), default=None),
+        "daily_details": daily,
     }
 
 
-def dollars(value, missing="无记账记录"):
-    return missing if value is None else f"${value:,.4f}"
-
-
-def print_report(report):
-    print(f"Vertex 花费日报 · {report['date']} · 运行主机账本日")
-    print(f"当日已记账合计：{dollars(report['daily_usd'])}")
-    for row in report["configs"]:
-        budget = dollars(row["remaining_usd"], "未设上限")
-        used = dollars(row["used_usd"])
-        print(f"配置 {row['slot']}：{dollars(row['day_usd'])}｜累计 {used}｜本地总预算余额 {budget}")
-    if report["other_configs_usd"]:
-        print(f"合计含已移除配置：{dollars(report['other_configs_usd'])}")
-    print("金额为本地估算，Google 账单及赠金抵扣需另核。")
+def print_report(result):
+    print(f"Google 官方账单日报 · {result['date']} · {result['timezone']}")
+    for title, key in (("当日已入账", "daily"), ("本月截至该日已入账", "month_through_date")):
+        if not result[key]:
+            print(f"{title}：未知，导出中无对应记录")
+        for currency, values in result[key].items():
+            print(f"{title} [{currency}] 费用 {values['cost']}，全部抵扣 {values['credits']}，"
+                  f"其中促销赠金 {values['promotional_credits']}，净费用 {values['net']}")
+    print(f"所查记录最近导出时间：{result['latest_export_time_in_period'] or '未知'}")
+    print("官方账单导出可能滞后，后续入账及调整会改变结果。净费用为费用加抵扣。")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--date", type=date.fromisoformat, help="ledger date, default yesterday on the runner host")
-    parser.add_argument("--json", action="store_true", help="machine-readable output")
-    parser.add_argument("--root", default="~/.agy-cli-manager", help="runner data directory on the target host")
-    parser.add_argument("--ssh-target", help="SSH config alias or user@host for the runner host")
+    parser.add_argument("--settings", type=Path, required=True, help="local JSON settings file")
+    parser.add_argument("--date", type=date.fromisoformat, help="usage date, default yesterday")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--dry-run", action="store_true", help="validate query without executing it")
     args = parser.parse_args()
-
-    if args.ssh_target:
-        if args.ssh_target.startswith("-") or any(c.isspace() for c in args.ssh_target):
-            parser.error("invalid SSH target")
-        script = Path(__file__).resolve()
-        flags = ["--root", args.root]
-        if args.date:
-            flags.extend(("--date", args.date.isoformat()))
-        if args.json:
-            flags.append("--json")
-        source = script.read_text()
-        remote_command = f"python3 - {shlex.join(flags)}"
-        try:
-            return subprocess.run(
-                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", args.ssh_target, remote_command],
-                input=source, text=True, timeout=45,
-            ).returncode
-        except (OSError, subprocess.TimeoutExpired):
-            print("Vertex 花费未知，SSH 查询失败。", file=sys.stderr)
-            return 1
-
-    today = datetime.now().astimezone().date()
-    day = args.date or today - timedelta(days=1)
-    if day > today:
-        parser.error("date cannot be later than the runner host's ledger date")
     try:
-        report = read_report(Path(args.root).expanduser(), day.isoformat())
-    except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
-        print(f"Vertex 花费未知，无法读取账本或配置（{type(error).__name__}）。", file=sys.stderr)
+        settings = read_settings(args.settings)
+        today = datetime.now(ZoneInfo(settings.get("timezone", "Asia/Taipei"))).date()
+        day = args.date or today - timedelta(days=1)
+        if day > today:
+            raise ValueError("date is in the future")
+        data = run_query(settings, day, access_token(settings), args.dry_run)
+        result = data if args.dry_run else report(data, settings, day)
+        if args.json or args.dry_run:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            print_report(result)
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, InvalidOperation,
+            URLError, subprocess.SubprocessError) as error:
+        # Error type alone avoids exposing identity, table paths or token output.
+        print(f"官方花费未知（{type(error).__name__}）。核对账单导出、IAM、gcloud 登录和查询上限。", file=sys.stderr)
+        if isinstance(error, RuntimeError):
+            print(str(error), file=sys.stderr)
         return 1
-    if args.json:
-        print(json.dumps(report, ensure_ascii=False))
-    else:
-        print_report(report)
-    return 0
 
 
 if __name__ == "__main__":

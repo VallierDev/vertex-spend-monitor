@@ -1,33 +1,34 @@
 ---
 name: vertex-spend-monitor
-description: 查询 Vertex runner 的每日估算花费及本地预算，按需设置每日监控报告。适用于 Google Cloud 赠金用量、Vertex 共享池花费日报和预算查询。
+description: 查询 Google Cloud 官方已入账的每日及本月费用、赠金抵扣和净费用，按需设置每日预算监控报告。适用于 Vertex、Google AI 和 Cloud 赠金的官方账单查询。
 ---
 
-# Vertex 每日花费监控
+# Google Cloud 官方花费监控
 
-## 查询
+## 查询准备
 
-先按 README.md 核对数据格式和配置。需要 Python 3.10+，只用标准库。数据目录由使用者配置，凭据保存在运行主机。
+阅读 README.md 的配置和验证边界。数据源为 Cloud Billing 标准或详细使用费 BigQuery 导出。用户本地的 settings.local.json 指向已启用的导出表。运行主机通过 gcloud 已有身份认证，凭据留在本地。
 
-在 runner 本机执行，默认查询主机时区的昨天。
+先检查导出和 IAM 是否齐备。导出未启用、无数据或权限不足时报告官方金额未知，说明需要补齐的依赖。启用导出及建立资源按用户授权执行。
 
-```sh
-python3 scripts/daily.py
-python3 scripts/daily.py --root /path/to/runner-data --date YYYY-MM-DD --json
-```
+## 官方账单查询
 
-通过使用者已有的 SSH 配置查询远程主机。
+需要 Python 3.10+ 和 gcloud。命令在技能目录执行。
 
 ```sh
-python3 scripts/daily.py --ssh-target runner-alias
+python3 scripts/daily.py --settings settings.local.json --dry-run
+python3 scripts/daily.py --settings settings.local.json
+python3 scripts/daily.py --settings settings.local.json --date YYYY-MM-DD --json
 ```
 
-报告日期、各配置的当日估算、账本合计和本地总预算余额。共享池数字包含所有使用该配置的任务。缺记录时报告「无记账记录」，读取失败时报告「未知」并保留错误摘要。
+默认查询所配时区的昨天，附上本月截至该日的已入账费用。按账单币种分开汇报费用、全部抵扣、其中促销赠金抵扣和净费用。净费用 = 费用 + 抵扣，抵扣通常为负数。按用量日期汇总，月计覆盖该月第一天至所查日期。
 
-金额来自 runner 按配置价格计算的账本，包含账本已计入的缓存费用。Google 官方入账金额、赠金抵扣及剩余赠金需要从 Cloud Billing 报告或已有账单导出核对。先确认来源和日期口径，再根据用户所需报告金额。
+结果涵盖表内整个结算账号的服务和项目。查询具体 Vertex 项目时，从 daily_details 读取对应项目及服务的明细，并保留账号整体支出以支持预算检查。
+
+报告币种、日期、时区及所查记录最近导出时间。无对应记录时金额未知。后续入账及调整可能改变金额。检查赠金剩余余额时另外读取官方赠金页。预算告警及余额以官方对应数据核对。
 
 ## 每日监控
 
-用户要配置或生成监控方案时，将查询命令与报告模板交给其选择的调度器。若只是交付 Skill 或询问能力，完成交付。用户明确要求启动定时报告后，先查现有同类任务，复用或更新，按用户指定的时区、时间和交付位置配置。未指定时间时询问或提出默认值。
+用户要交付 Skill 或监控方案时提供命令和调度示例。用户明确要求启动定时报告后，先查现有同类任务，按其时区、时间及交付位置复用或设置。脚本输出查询结果，由用户选择的调度器发送。
 
-日报包含所查日期、美元总估算、各配置估算和本地预算余额。金额标明本地估算，缺数据及查询失败保留未知状态。脚本只输出结果，由调度器发送。具体命令及通用调度示例见 README.md。
+日报包含官方来源、每日费用、抵扣、净费用、本月截至该日累计、币种、时区、导出时间和异常。缺数据或查询失败保留未知状态。因账单入账有延迟，执行硬性费用上限时另核服务侧配额和限额能力。
