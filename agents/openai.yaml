@@ -1,0 +1,3 @@
+interface:
+  display_name: "Vertex 每日花费"
+  short_description: "查询 Vertex 估算花费与预算，按需配置每日监控"
