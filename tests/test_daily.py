@@ -82,6 +82,16 @@ class OfficialBillingTests(unittest.TestCase):
         self.assertTrue(result["dry_run"])
         self.assertTrue(api.call_args.args[2]["dryRun"])
 
+    def test_isolated_auth_directory(self):
+        settings = dict(self.settings, auth="adc", gcloud_config_dir="~/example-auth")
+        with patch.object(daily.subprocess, "run") as process:
+            process.return_value.returncode = 0
+            process.return_value.stdout = "test-placeholder\n"
+            self.assertEqual(daily.access_token(settings), "test-placeholder")
+        self.assertEqual(process.call_args.kwargs["env"]["CLOUDSDK_CONFIG"],
+                         str(Path.home() / "example-auth"))
+        self.assertIn("application-default", process.call_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

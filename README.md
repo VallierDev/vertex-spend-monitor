@@ -30,6 +30,8 @@
 
 脚本使用 Python 标准库。auth=user 使用 gcloud auth print-access-token，auth=adc 使用 gcloud auth application-default print-access-token。gcloud 配置、OAuth 文件和本地设置由使用者自行保管。
 
+需要使用独立登录目录时，在本地设置中加入 gcloud_config_dir，填写对应的 gcloud 配置目录。脚本仅对子进程设置 CLOUDSDK_CONFIG，查询身份按该目录中的登录配置选择。
+
 maximum_bytes_billed 为单次查询的扫描计费上限，默认 1 GB。BigQuery 查询可能产生费用，超过上限的查询失败。根据表规模配置相应上限。
 
 官方说明见 [启用账单导出](https://docs.cloud.google.com/billing/docs/how-to/export-data-bigquery-setup)、[导出表结构](https://docs.cloud.google.com/billing/docs/how-to/export-data-bigquery-tables/standard-usage) 和 [费用与抵扣查询示例](https://docs.cloud.google.com/billing/docs/how-to/bq-examples)。

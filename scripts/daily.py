@@ -5,6 +5,7 @@ import argparse
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -41,7 +42,10 @@ def access_token(settings):
     if settings.get("auth") == "adc":
         command.append("application-default")
     command.append("print-access-token")
-    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    environment = os.environ.copy()
+    if settings.get("gcloud_config_dir"):
+        environment["CLOUDSDK_CONFIG"] = str(Path(settings["gcloud_config_dir"]).expanduser())
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30, env=environment)
     if result.returncode or not result.stdout.strip():
         raise RuntimeError("gcloud authentication failed; verify the selected local identity")
     return result.stdout.strip()
@@ -58,6 +62,8 @@ def request(token, path, body=None):
             return json.load(response)
     except HTTPError as error:
         # Keep returned messages and authentication headers out of reports.
+        if error.code == 404:
+            raise RuntimeError("Official billing table is unavailable; verify export startup, table name and location") from None
         raise RuntimeError(f"BigQuery HTTP {error.code}; check export, IAM and query limits") from None
 
 
